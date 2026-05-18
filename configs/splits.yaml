@@ -1,0 +1,92 @@
+# ExecDPT — Pre-registered Splits Configuration
+# ⚠️ FROZEN BEFORE ANY MODEL TRAINING — DO NOT MODIFY AFTER INITIAL COMMIT
+#
+# This file defines the exact train/test partition for all experiments.
+# Any modification after the initial commit invalidates the pre-registration.
+
+# ──────────────────────────────────────────────
+# Date boundary
+# ──────────────────────────────────────────────
+dates:
+  train_start: "2018-01-02"
+  train_end: "2024-03-29"
+  test_start: "2024-04-01"    # Date-OOD begins here
+  test_end: "2026-03-31"
+  # Robustness check cutoff (for sensitivity analysis):
+  robustness_cutoff: "2024-01-02"
+
+# ──────────────────────────────────────────────
+# Ticker split
+# ──────────────────────────────────────────────
+# 80 pretraining + 20 Stock-OOD, stratified by market cap (large/mid/small) and sector.
+# Tickers will be populated once LOBSTER license is confirmed.
+# Placeholder lists below — replace with actual NASDAQ tickers.
+
+tickers:
+  pretraining: []   # 80 tickers — TO BE FILLED after LOBSTER access confirmed
+  stock_ood: []     # 20 tickers — TO BE FILLED after LOBSTER access confirmed
+  # Stratification targets:
+  #   Large cap: 40 train / 10 OOD
+  #   Mid cap:   25 train / 6 OOD
+  #   Small cap: 15 train / 4 OOD
+
+# ──────────────────────────────────────────────
+# Parent order sizes (% of ADV)
+# ──────────────────────────────────────────────
+parent_sizes:
+  pretraining: [0.5, 1.0, 2.0, 5.0, 10.0]
+  size_ood: [15.0, 25.0]
+
+# ──────────────────────────────────────────────
+# Horizons
+# ──────────────────────────────────────────────
+horizons:
+  - "30min"
+  - "1hr"
+  - "full_day"
+
+# ──────────────────────────────────────────────
+# Sides
+# ──────────────────────────────────────────────
+sides: ["buy", "sell"]
+
+# ──────────────────────────────────────────────
+# Evaluation splits (derived from above)
+# ──────────────────────────────────────────────
+evaluation_splits:
+  stock_ood:
+    description: "20 tickers never seen during pretraining"
+    tickers: "stock_ood"
+    dates: "train"
+    parent_sizes: "pretraining"
+    expected_tasks: 1000
+
+  date_ood:
+    description: "All tasks dated Apr 2024 – Mar 2026 (regime shift)"
+    tickers: "pretraining"
+    dates: "test"
+    parent_sizes: "pretraining"
+    expected_tasks: 1000
+
+  size_ood:
+    description: "Parent sizes 15% and 25% ADV (out-of-distribution)"
+    tickers: "pretraining"
+    dates: "train"
+    parent_sizes: "size_ood"
+    expected_tasks: 800
+
+  joint_ood:
+    description: "All three dimensions held out simultaneously"
+    tickers: "stock_ood"
+    dates: "test"
+    parent_sizes: "size_ood"
+    expected_tasks: 400
+
+# ──────────────────────────────────────────────
+# Sampling
+# ──────────────────────────────────────────────
+sampling:
+  dates_per_ticker: 50
+  total_candidate_tasks: 150000   # 100 × 50 × 5 × 3 × 2
+  pretraining_subsample: 5000     # stratified subsample
+  random_seed: 42
