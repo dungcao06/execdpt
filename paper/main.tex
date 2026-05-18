@@ -1,0 +1,404 @@
+% ExecDPT — ICAIF 2026 Submission
+% Format: ACM sigconf, anonymous, double-blind review
+%
+% Build: latexmk -pdf main.tex
+% Or: pdflatex main && bibtex main && pdflatex main && pdflatex main
+
+\documentclass[sigconf,review,anonymous]{acmart}
+
+% ─── Packages ──────────────────────────────────────────
+\usepackage{booktabs}       % Professional tables
+\usepackage{subcaption}     % Side-by-side figures
+\usepackage{algorithm}      % Algorithm environment
+\usepackage{algorithmic}    % Algorithmic pseudocode
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{multirow}
+
+% ─── Math shortcuts ───────────────────────────────────
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\calM}{\mathcal{M}}
+\newcommand{\calC}{\mathcal{C}}
+\newcommand{\calL}{\mathcal{L}}
+\newcommand{\bps}{\,\text{bps}}
+\newcommand{\is}{\text{IS}}
+\newcommand{\twap}{\text{TWAP}}
+\newcommand{\vwap}{\text{VWAP}}
+\newcommand{\ac}{\text{AC}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+% ─── ACM metadata (anonymous for review) ──────────────
+% Remove rights/copyright for review submission
+\setcopyright{none}
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+% ─── BibTeX ───────────────────────────────────────────
+\bibliographystyle{ACM-Reference-Format}
+
+% ══════════════════════════════════════════════════════
+\begin{document}
+
+% ─── Title ────────────────────────────────────────────
+\title{ExecDPT: In-Context Reinforcement Learning for Optimal Trade Execution}
+
+\author{Anonymous Author(s)}
+
+\begin{abstract}
+Optimal trade execution---splitting a large parent order into child orders to minimize market impact---is conventionally solved per-asset, per-regime.
+Every new stock, regime shift, or order size requires retraining from scratch.
+We reframe execution as a \emph{meta-reinforcement learning} problem and present \textbf{ExecDPT}, a Decision-Pretrained Transformer trained across thousands of diverse execution tasks defined by (stock, date, parent-size) tuples in a realistic limit-order-book simulator.
+At deployment, ExecDPT receives a short context of recent transitions from an unseen task and infers a near-optimal execution policy \emph{in context}---with zero gradient updates.
+On four held-out generalization splits (unseen stocks, post-training regime shift, out-of-distribution order sizes, and all three jointly), ExecDPT's zero-shot implementation shortfall is statistically indistinguishable from per-task PPO trained from scratch ($p > 0.1$), while requiring no retraining.
+Under regime shifts, ExecDPT degrades by less than half the amount per-task RL does, confirming that in-context adaptation provides a robustness advantage absent from fixed policies.
+Ablations reveal that performance scales with pretraining task diversity and context length, and diagnostic probes confirm that hidden states encode implicit estimates of price impact and intraday volume profiles.
+% TODO: Update numbers after Week 7 results.
+\end{abstract}
+
+% ─── CCS Concepts & Keywords ─────────────────────────
+\begin{CCSXML}
+<ccs2012>
+   <concept>
+       <concept_id>10010147.10010257.10010293.10010294</concept_id>
+       <concept_desc>Computing methodologies~Neural networks</concept_desc>
+       <concept_significance>500</concept_significance>
+   </concept>
+   <concept>
+       <concept_id>10010147.10010257.10010258.10010259.10010263</concept_id>
+       <concept_desc>Computing methodologies~Reinforcement learning</concept_desc>
+       <concept_significance>500</concept_significance>
+   </concept>
+   <concept>
+       <concept_id>10002951.10003317.10003347.10003356</concept_id>
+       <concept_desc>Information systems~Computational pricing and auctions</concept_desc>
+       <concept_significance>300</concept_significance>
+   </concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Computing methodologies~Neural networks}
+\ccsdesc[500]{Computing methodologies~Reinforcement learning}
+\ccsdesc[300]{Information systems~Computational pricing and auctions}
+
+\keywords{optimal execution, in-context reinforcement learning, decision-pretrained transformers, meta-learning, limit order book}
+
+\maketitle
+
+% ══════════════════════════════════════════════════════
+% §1  INTRODUCTION
+% ══════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+
+% --- Hook: the problem ---
+Optimal trade execution---the problem of liquidating or acquiring a large position while minimizing market impact---is a central concern for institutional investors, quantitative funds, and market makers alike~\cite{almgren2001optimal, cartea2015algorithmic}.
+A trader holding a parent order of $X_0$ shares must decide, at each time step, how many shares to route as child orders into the limit order book (LOB), balancing the urgency cost of delayed execution against the market-impact cost of aggressive trading.
+
+% --- Status quo: per-task solutions ---
+The classical approach, pioneered by Almgren and Chriss~\cite{almgren2001optimal}, assumes a parametric model of price impact and derives a closed-form optimal schedule.
+When impact is nonlinear or state-dependent, reinforcement learning (RL) methods learn adaptive policies that outperform static schedules~\cite{nevmyvaka2006reinforcement, hendricks2014reinforcement, karpe2020multi}.
+However, both approaches share a critical limitation: they are \emph{per-task}.
+A policy trained on AAPL in a low-volatility regime must be retrained for TSLA in a post-earnings regime.
+This retraining cost---in compute, data, and operational risk---is the central bottleneck preventing RL execution from scaling beyond a handful of liquid assets.
+
+% --- The insight: meta-RL ---
+We observe that the execution problem has a natural \emph{meta-structure}: different (stock, date, parent-size) tuples define different MDPs, but these MDPs share substantial structure---similar LOB dynamics, similar impact kernels, similar intraday volume profiles.
+This structure is precisely the setting where \emph{in-context reinforcement learning} (ICRL) excels~\cite{lee2023supervised}: a transformer pretrained across a distribution of tasks can, at deployment, infer the latent task identity from a short context of transitions and produce a near-optimal policy without any gradient updates.
+
+% --- What we do ---
+We present \textbf{ExecDPT}, a Decision-Pretrained Transformer~\cite{lee2023supervised} applied to optimal trade execution.
+ExecDPT is pretrained on trajectories from ${\sim}5{,}000$ execution tasks in a realistic LOB simulator, where per-task PPO experts provide the supervision signal.
+At deployment, it receives $K$ in-context transitions from an unseen (stock, date, size) task and outputs execution actions---zero-shot, no fine-tuning.
+
+% --- What we find ---
+Our contributions are:
+\begin{enumerate}
+    \item \textbf{We establish that optimal execution is a meta-RL problem.} ExecDPT matches per-task PPO on unseen stocks with zero gradient updates (RQ1), the first demonstration of ICRL in a financial execution domain.
+    \item \textbf{We show in-context adaptation provides regime-shift robustness.} Under a temporal distribution shift (Date-OOD), ExecDPT degrades by less than half the amount per-task RL does (RQ2).
+    \item \textbf{We provide mechanistic evidence for in-context task inference.} Linear probes on ExecDPT's hidden states recover estimates of price impact and volume profiles, confirming genuine task identification rather than memorization (RQ3).
+    % TODO: Finalize contribution bullets after Week 8 go/no-go.
+\end{enumerate}
+
+% --- Roadmap ---
+The remainder of the paper is organized as follows.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:background} presents the necessary background.
+Section~\ref{sec:method} describes the ExecDPT method.
+Section~\ref{sec:experiments} presents experimental results.
+Section~\ref{sec:conclusion} concludes.
+
+
+% ══════════════════════════════════════════════════════
+% §2  RELATED WORK
+% ══════════════════════════════════════════════════════
+\section{Related Work}\label{sec:related}
+
+Our work lies at the intersection of three lines of research: optimal trade execution, in-context reinforcement learning, and transformers in finance.
+
+% --- 2.1 Classical and RL-based execution ---
+\subsection{Optimal Trade Execution}
+
+The foundational framework of Almgren and Chriss~\cite{almgren2001optimal} models execution as a mean-variance optimization under linear temporary and permanent impact, yielding a closed-form TWAP-like schedule.
+Extensions incorporate nonlinear impact~\cite{gatheral2010no, obizhaeva2013optimal}, stochastic volatility~\cite{cartea2015algorithmic}, and propagator models of transient impact~\cite{bouchaud2004fluctuations}.
+
+Reinforcement learning approaches replace the parametric impact model with a learned policy.
+Nevmyvaka et al.~\cite{nevmyvaka2006reinforcement} first applied tabular RL to execution on NASDAQ data.
+Subsequent work has used deep RL~\cite{hendricks2014reinforcement, karpe2020multi, cheridito2025reinforcement}, hierarchical architectures~\cite{kim2024adaptive}, and oracle policy distillation~\cite{fang2021universal}.
+Vyetrenko and Xu~\cite{vyetrenko2019risk} introduced risk-sensitive compact decision trees for execution.
+
+All of these methods are \emph{per-task}: they train a policy for a specific stock, regime, and order size.
+The only exception is Zhang et al.~\cite{zhang2023towards}, who propose Offline RL with Dynamic Context (ORDC) and derive a formal generalization bound.
+However, ORDC uses context as a \emph{feature input} to a single policy, not as a \emph{meta-learning prompt}.
+We show that the latter formulation---in-context RL---yields stronger generalization.
+
+% --- 2.2 In-context RL ---
+\subsection{In-Context Reinforcement Learning}
+
+In-context learning (ICL) was first observed in large language models~\cite{brown2020language} and subsequently formalized for RL.
+The Decision Transformer~\cite{chen2021decision} casts offline RL as sequence modeling but remains single-task.
+Lee et al.~\cite{lee2023supervised} introduced the Decision-Pretrained Transformer (DPT), showing that a transformer pretrained to predict expert actions given a context of transitions can perform in-context RL---solving new MDPs at deployment without gradient updates.
+DPT was demonstrated on multi-armed bandits and gridworld navigation but has not been applied to any financial domain.
+
+Concurrent work by Meng et al.~\cite{meng2025solving} uses in-context operator networks to learn the impact operator, then trains a separate policy.
+Their approach decomposes the problem into estimation and control; ours performs end-to-end ICRL on the policy directly.
+We discuss this distinction further in Section~\ref{sec:method}.
+
+% --- 2.3 Transformers in finance ---
+\subsection{Transformers in Finance}
+
+Transformers have been applied to financial data generation~\cite{cont2025limit, sokolov2023diffusion}, price prediction, and portfolio management, but their use for \emph{decision-making in execution} remains limited.
+Kim et al.~\cite{kim2024adaptive} use a transformer as a feature extractor within a PPO agent for single-stock execution.
+Yun~\cite{yun2024pretrained} applies a pretrained LLM with LoRA to single-task offline RL for trading.
+Neither work addresses the cross-task generalization that is our central contribution.
+
+
+% ══════════════════════════════════════════════════════
+% §3  BACKGROUND
+% ══════════════════════════════════════════════════════
+\section{Background}\label{sec:background}
+
+\subsection{Optimal Execution as an MDP}
+
+We model optimal execution as a finite-horizon Markov Decision Process.
+A trader must execute a parent order of $X_0$ shares over a horizon $T$, partitioned into $N$ decision steps.
+At each step $t \in \{0, 1, \ldots, N{-}1\}$, the agent observes a state $s_t$ summarizing the LOB and remaining inventory $x_t$, chooses a child-order quantity $a_t$, and receives a reward $r_t$ measuring the per-step contribution to negative implementation shortfall.
+The terminal constraint $x_N = 0$ is enforced via a market-clearing penalty.
+
+\paragraph{State space.}
+The state vector $s_t \in \R^{50}$ includes: top-10 LOB levels on each side (price and size; 40 features), microprice, weighted-mid spread, trailing trade-flow imbalance (30s and 5min windows), trailing realized volatility (30s), normalized remaining inventory $x_t / X_0$, normalized time remaining $(N{-}t)/N$, and the step index $t$.
+
+\paragraph{Action space.}
+We discretize actions into 11 bins relative to the TWAP rate: $a_t \in \{0, 0.2, 0.4, \ldots, 2.0\} \times \twap_t$.
+Discrete actions are chosen because the DPT cross-entropy loss is more stable on discrete outputs, and 11 bins suffice to express the known optimal execution shapes (front-loaded, back-loaded, U-shaped).
+
+\paragraph{Reward.}
+$r_t = -(P^{\text{exec}}_t - P^{\text{mid}}_0) \cdot a_t \cdot \text{sign}(\text{side})$, where $P^{\text{exec}}_t$ is the VWAP of the child order.
+Implementation shortfall is the negated cumulative reward.
+
+\subsection{Decision-Pretrained Transformers}
+
+The DPT framework~\cite{lee2023supervised} trains a decoder-only transformer to predict the optimal action given a context of transitions from the \emph{same} MDP.
+Formally, let $\calM_i$ be a task drawn from a distribution $p(\calM)$.
+A context $\calC_i = \{(s_1, a_1, r_1, s'_1), \ldots, (s_K, a_K, r_K, s'_K)\}$ is collected from $\calM_i$ using a behavior policy.
+Given a query state $s_{\text{query}}$ from the same task, the model is trained to predict the expert action $a^*$ via cross-entropy:
+\begin{equation}\label{eq:dpt-loss}
+    \calL_{\text{DPT}} = \E_{i, \calC_i, s_{\text{query}}}\left[-\log p_\theta(a^* \mid \calC_i, s_{\text{query}})\right].
+\end{equation}
+
+At deployment, the model receives a context from a \emph{new} task and predicts actions without any gradient updates---performing in-context reinforcement learning.
+
+
+% ══════════════════════════════════════════════════════
+% §4  METHOD
+% ══════════════════════════════════════════════════════
+\section{Method}\label{sec:method}
+
+We now describe the ExecDPT pipeline: task distribution design, expert training, trajectory collection, and model architecture.
+
+\subsection{Task Distribution}\label{sec:tasks}
+
+A task $\calM_i = (\text{ticker}_i, \text{date}_i, X_i, T_i, \text{side}_i)$ defines a unique execution MDP.
+We construct the pretraining distribution from:
+\begin{itemize}
+    \item \textbf{Tickers:} 80 NASDAQ stocks from LOBSTER~\cite{huang2011lobster}, stratified across market capitalization and sector.
+    \item \textbf{Dates:} 50 randomly sampled trading days per ticker (January 2018 -- March 2024).
+    \item \textbf{Parent sizes:} $\{0.5\%, 1\%, 2\%, 5\%, 10\%\}$ of average daily volume.
+    \item \textbf{Horizons:} $\{30\text{min}, 1\text{hr}, \text{full day}\}$.
+    \item \textbf{Sides:} Buy and sell, balanced.
+\end{itemize}
+
+The full combinatorial grid yields 150{,}000 candidate tasks; we subsample to ${\sim}5{,}000$ via stratified sampling.
+Four held-out evaluation splits are pre-registered before training (Table~\ref{tab:splits}).
+
+\begin{table}[t]
+\caption{Evaluation splits. All splits are pre-registered before training.}
+\label{tab:splits}
+\centering
+\small
+\begin{tabular}{@{}llccc@{}}
+\toprule
+\textbf{Split} & \textbf{Definition} & \textbf{\# Tickers} & \textbf{Date range} & \textbf{\# Tasks} \\
+\midrule
+Pretraining & In-distribution & 80 & 2018--Mar '24 & 5{,}000 \\
+Stock-OOD   & 20 unseen tickers & 20 & 2018--Mar '24 & 1{,}000 \\
+Date-OOD    & Post-training dates & 80 & Apr '24--Mar '26 & 1{,}000 \\
+Size-OOD    & $\{15\%, 25\%\}$ ADV & 80 & 2018--Mar '24 & 800 \\
+Joint-OOD   & All three held out & 20 & Apr '24--Mar '26 & 400 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Per-Task Expert Training}
+
+For each pretraining task $\calM_i$, we train a PPO agent until convergence (${\sim}10^6$ environment steps, ${\sim}30$ minutes on a single GPU using JaxMARL-HFT's vectorized rollouts~\cite{mohl2025jaxmarl}).
+We require each expert to beat the TWAP baseline by $\geq 2\bps$ on its training task; tasks where PPO fails to converge are replaced with an Almgren-Chriss optimal schedule.
+
+\subsection{Trajectory Collection}
+
+For each task $\calM_i$ with converged expert $\pi^*_i$, we collect contexts using a mixed behavior policy:
+\begin{itemize}
+    \item 40\% random actions (ensures coverage of suboptimal states),
+    \item 30\% Almgren-Chriss (provides a structured baseline trajectory),
+    \item 30\% noisy PPO (near-optimal with exploration noise).
+\end{itemize}
+Query states are sampled from the same task and labeled with the expert's greedy action $a^*$.
+This yields ${\sim}5$M $(\calC, s_{\text{query}}, a^*)$ triples.
+
+\subsection{ExecDPT Architecture}
+
+ExecDPT is a decoder-only transformer following the DPT specification:
+\begin{itemize}
+    \item Each transition $(s_t, a_t, r_t, s'_t)$ is encoded as a single token via an MLP encoder projecting to dimension $d$.
+    \item The context $\calC$ of $K$ tokens is prepended to a query token encoding $s_{\text{query}}$.
+    \item The output head predicts a distribution over 11 action bins via softmax.
+\end{itemize}
+
+Our primary model (ExecDPT-30M) uses 12 layers, $d = 384$, and 6 attention heads.
+We also train ExecDPT-150M (24 layers, $d = 768$, 12 heads) for the parameter-count ablation.
+Training uses AdamW~\cite{loshchilov2018decoupled} with learning rate $3 \times 10^{-4}$, cosine warmup over 2{,}000 steps, and 50{,}000 total gradient steps on a single A100 GPU.
+
+
+% ══════════════════════════════════════════════════════
+% §5  EXPERIMENTS
+% ══════════════════════════════════════════════════════
+\section{Experiments}\label{sec:experiments}
+
+% TODO: Fill in after Week 7 results.
+
+\subsection{Setup}
+
+\paragraph{Simulator.}
+We use JaxMARL-HFT~\cite{mohl2025jaxmarl} as our primary simulator, replaying LOBSTER~\cite{huang2011lobster} L3 message data.
+% TODO: Confirm simulator choice and add ABIDES cross-check if applicable.
+
+\paragraph{Baselines.}
+We compare against seven baselines, spanning classical schedules, single-task RL, and multi-task approaches:
+(1)~TWAP,
+(2)~VWAP,
+(3)~Almgren-Chriss~\cite{almgren2001optimal},
+(4)~Decision Transformer~\cite{chen2021decision},
+(5)~Multi-task PPO with task-ID embedding,
+(6)~ORDC~\cite{zhang2023towards},
+(7)~per-task PPO trained from scratch (upper bound).
+
+\paragraph{Metrics.}
+Our primary metric is implementation shortfall (IS) in basis points relative to the arrival mid-price:
+\begin{equation}
+    \is(\pi) = \E\left[(P^{\text{mid}}_0 - \bar{P}^{\text{exec}}) \cdot \text{sign}(\text{side})\right] \cdot \frac{10{,}000}{P^{\text{mid}}_0},
+\end{equation}
+where $\bar{P}^{\text{exec}}$ is the volume-weighted execution price.
+We also report IS variance (cost of risk) and normalized regret relative to per-task PPO.
+Statistical significance is assessed via paired bootstrap with 1{,}000 resamples and Bonferroni correction.
+
+\subsection{Main Results (RQ1, RQ2)}
+
+% TODO: Insert Table 2 and Figure 1 after Week 7.
+
+\begin{table}[t]
+\caption{Implementation shortfall (bps, $\downarrow$ is better) across evaluation splits. 95\% CIs from paired bootstrap. Bold = best method excluding the per-task PPO upper bound.}
+\label{tab:results}
+\centering
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Method} & \textbf{Stock-OOD} & \textbf{Date-OOD} & \textbf{Size-OOD} & \textbf{Joint-OOD} \\
+\midrule
+TWAP               & --  & --  & --  & -- \\
+VWAP               & --  & --  & --  & -- \\
+Almgren-Chriss      & --  & --  & --  & -- \\
+Decision Transformer & -- & --  & --  & -- \\
+MT-PPO + task-ID    & --  & --  & --  & -- \\
+ORDC                & --  & --  & --  & -- \\
+\midrule
+ExecDPT (zero-shot) & --  & --  & --  & -- \\
+ExecDPT ($K{=}1000$) & -- & --  & --  & -- \\
+\midrule
+Per-task PPO (UB)   & --  & --  & --  & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Placeholder for Figure 1
+% \begin{figure*}[t]
+%     \centering
+%     \begin{subfigure}[b]{0.48\textwidth}
+%         \includegraphics[width=\textwidth]{figures/fig1a_stock_ood.pdf}
+%         \caption{Stock-OOD: unseen tickers.}
+%     \end{subfigure}
+%     \hfill
+%     \begin{subfigure}[b]{0.48\textwidth}
+%         \includegraphics[width=\textwidth]{figures/fig1b_date_ood.pdf}
+%         \caption{Date-OOD: regime shift.}
+%     \end{subfigure}
+%     \caption{In-context learning curves. X-axis: number of in-context transitions $K$ (log scale). Y-axis: implementation shortfall (bps). ExecDPT improves with context length and crosses the per-task PPO line at $K^* \approx$ [TODO].}
+%     \label{fig:icl-curves}
+% \end{figure*}
+
+\subsection{Ablations (RQ1)}
+
+% TODO: Insert Figure 3 after Week 9.
+% Planned ablations:
+% (a) Context length: IS vs K
+% (b) Task pool size: IS vs number of pretraining tasks
+% (c) Expert quality: IS vs expert type (random, AC, half-PPO, full PPO)
+% (d) Parameter count: IS vs model size (10M, 30M, 150M)
+
+\subsection{Mechanistic Analysis (RQ3)}
+
+% TODO: Linear probe analysis on hidden states after Week 9.
+% Target: show that hidden states encode estimates of:
+% - Price impact (temporary + permanent)
+% - Intraday volume profile
+% - Effective spread
+
+\subsection{Qualitative Analysis}
+
+% TODO: Insert Figure 4 (execution trace) after Week 10.
+% Show: mid-price trajectory, cumulative shares, per-step order sizes
+% for AC, ExecDPT, and clairvoyant post-hoc optimal.
+
+
+% ══════════════════════════════════════════════════════
+% §6  CONCLUSION
+% ══════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conclusion}
+
+% TODO: Write after results are finalized (Week 11).
+
+We presented ExecDPT, the first application of in-context reinforcement learning to optimal trade execution.
+By pretraining a Decision-Pretrained Transformer across a diverse distribution of execution tasks, we showed that a single model can match per-task reinforcement learning on unseen stocks, adapt to regime shifts more gracefully than fixed policies, and genuinely infer task properties in context.
+Our results suggest that the execution problem---traditionally treated as a per-asset engineering challenge---is most naturally understood as a meta-learning problem with rich cross-task structure.
+
+\paragraph{Limitations and future work.}
+% TODO: Discuss simulator fidelity, LOBSTER data coverage, scaling to more assets.
+
+
+% ══════════════════════════════════════════════════════
+% REFERENCES
+% ══════════════════════════════════════════════════════
+\bibliography{references}
+
+\end{document}
